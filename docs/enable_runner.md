@@ -40,7 +40,9 @@ main():
         else:
             POST /projects/:id/runners runner_id=enable_runner
             201 -> count ASSIGN, print ASSIGN, audit "assigned"
-            409 -> count ALREADY, print ALREADY
+            400/409 -> re-read GET /projects/:id/runners?type=project_type
+                runner now enabled -> count ASSIGN, print ASSIGN (confirmed), audit "assigned" with verified_after_error
+                otherwise (or re-read fails) -> count FAIL, print to stderr, audit "failed", continue
             401 -> abort the run
             other -> count FAIL, print to stderr, audit "failed", continue
 

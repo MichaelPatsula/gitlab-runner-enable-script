@@ -149,14 +149,23 @@ def _assign(
     stats: Stats,
     audit: Optional[AuditLog] = None,
 ) -> None:
+    project_id = int(project["id"])
     try:
-        client.assign_runner(int(project["id"]), enable_runner_id)
+        client.assign_runner(project_id, enable_runner_id)
     except GitLabError as exc:
         if exc.status == 401:
             raise
-        if exc.status == 409:
-            stats.already += 1
-            print(f"ALREADY {label}: runner #{enable_runner_id} is already enabled")
+        # GitLab answers a duplicate assignment with 400 (409 on some versions). That
+        # happens when a retried POST follows an attempt whose response was lost, so
+        # check whether the runner is now enabled before reporting a failure.
+        if exc.status in (400, 409) and _runner_enabled(client, project_id, enable_runner_id):
+            stats.assigned += 1
+            print(
+                f"ASSIGN {label}: enabled runner #{enable_runner_id} "
+                f"(confirmed after GitLab returned {exc.status}: {exc.message})"
+            )
+            if audit is not None:
+                audit.record("assigned", project, verified_after_error=exc.message)
             return
         stats.failed += 1
         print(f"FAIL {label}: {exc.message}", file=sys.stderr)
@@ -167,6 +176,15 @@ def _assign(
     print(f"ASSIGN {label}: enabled runner #{enable_runner_id}")
     if audit is not None:
         audit.record("assigned", project)
+
+
+def _runner_enabled(client: GitLabClient, project_id: int, runner_id: int) -> bool:
+    try:
+        return runner_id in client.project_runner_ids(project_id, runner_type="project_type")
+    except GitLabError as exc:
+        if exc.status == 401:
+            raise
+        return False
 
 
 def build_parser() -> argparse.ArgumentParser:

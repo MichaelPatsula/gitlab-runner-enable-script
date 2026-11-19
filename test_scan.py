@@ -427,11 +427,13 @@ class InterruptTests(unittest.TestCase):
 class ScriptedClient:
     """Per-project scripted results for project scans and assignments."""
 
-    def __init__(self, enabled=None, scan_errors=None, assign_errors=None) -> None:
+    def __init__(self, enabled=None, scan_errors=None, assign_errors=None, applied_before_error=()) -> None:
         self.base_url = "https://gitlab.example.com"
         self.enabled = enabled or {}
         self.scan_errors = scan_errors or {}
         self.assign_errors = assign_errors or {}
+        # Project ids where GitLab saves the assignment before the scripted error is raised.
+        self.applied_before_error = set(applied_before_error)
         self.scanned_ids: list[int] = []
         self.assigned: list[tuple[int, int]] = []
 
@@ -442,6 +444,8 @@ class ScriptedClient:
         return set(self.enabled.get(project_id, set()))
 
     def assign_runner(self, project_id: int, runner_id: int) -> None:
+        if project_id in self.applied_before_error:
+            self.enabled.setdefault(project_id, set()).add(runner_id)
         if project_id in self.assign_errors:
             raise self.assign_errors[project_id]
         self.assigned.append((project_id, runner_id))
@@ -588,16 +592,32 @@ class EnableAssignTests(unittest.TestCase):
         self.assertEqual(stats.matched, 1)
         self.assertIn("MATCH a/one (id=1): runner #6 is enabled; would enable runner #9", stdout)
 
-    def test_conflict_on_assign_counts_as_already_enabled(self) -> None:
+    def test_rejected_assign_that_did_apply_counts_as_assigned(self) -> None:
+        # A retried POST after a lost response: GitLab saved it, then rejected the duplicate.
         client = ScriptedClient(
             enabled={1: {6}},
-            assign_errors={1: GitLabError(409, "Conflict", "/projects/1/runners")},
+            assign_errors={1: GitLabError(400, "Runner has already been taken", "/projects/1/runners")},
+            applied_before_error={1},
         )
-        stats, stdout, _stderr = self._run(client, self.PROJECT)
-        self.assertEqual(stats.already, 1)
-        self.assertEqual(stats.assigned, 0)
-        self.assertEqual(stats.failed, 0)
-        self.assertIn("ALREADY a/one (id=1)", stdout)
+        audit_out = StringIO()
+        audit = enable_runner.AuditLog(audit_out, "https://gitlab.example.com", 6, 9)
+        with patch("sys.stdout", StringIO()) as stdout, patch("sys.stderr", StringIO()):
+            stats = enable_runner.enable_on_projects(client, self.PROJECT, 6, 9, True, False, False, None, audit)
+        self.assertEqual((stats.assigned, stats.already, stats.failed), (1, 0, 0))
+        self.assertEqual(client.scanned_ids, [1, 1])
+        self.assertIn("ASSIGN a/one (id=1): enabled runner #9 (confirmed after GitLab returned 400", stdout.getvalue())
+        record = json.loads(audit_out.getvalue())
+        self.assertEqual(record["event"], "assigned")
+        self.assertEqual(record["verified_after_error"], "Runner has already been taken")
+
+    def test_rejected_assign_that_did_not_apply_is_failed(self) -> None:
+        client = ScriptedClient(
+            enabled={1: {6}},
+            assign_errors={1: GitLabError(400, "limit reached", "/projects/1/runners")},
+        )
+        stats, _stdout, stderr = self._run(client, self.PROJECT)
+        self.assertEqual((stats.assigned, stats.failed), (0, 1))
+        self.assertIn("FAIL a/one (id=1): limit reached", stderr)
 
     def test_other_assign_error_is_reported_as_failed(self) -> None:
         client = ScriptedClient(

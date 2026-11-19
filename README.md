@@ -61,11 +61,13 @@ Pass `--audit-log PATH` to keep a record of what the script planned or changed. 
 | `event` | When | Extra fields |
 | --- | --- | --- |
 | `planned` | Dry-run match: `--apply` would assign the runner. | |
-| `assigned` | `--apply` assigned the runner. | |
+| `assigned` | `--apply` assigned the runner. | `verified_after_error` (only when GitLab rejected the request but a re-read showed the runner enabled; see below) |
 | `failed` | `--apply` tried to assign and GitLab returned an error. | `status`, `error` |
 | `skipped` | Only with `--audit-skips`: the project is archived, or `--if-runner` is not enabled. Projects without `--if-runner` are checked only with `--full-scan` or `--project`. | `reason` (`archived` or `runner_not_enabled`) |
 
 Projects that already have `--enable-runner` are not recorded, because nothing changed. Every line also has `time` (UTC), `gitlab`, `project_id`, `project_path`, `if_runner_id`, and `enable_runner_id`.
+
+Requests are retried after timeouts and server errors. If an assignment was saved but its response was lost, the retry is rejected as a duplicate (GitLab returns 400). When an assignment returns 400 or 409, the script reads the project's runners again. If `--enable-runner` is now enabled, it is reported as `ASSIGN ... (confirmed after GitLab returned ...)` and logged as `assigned` with `verified_after_error` set to GitLab's message. Otherwise it is a `failed` event, as before.
 
 ```json
 {"time": "2026-11-18T23:15:04+00:00", "event": "assigned", "gitlab": "https://gitlab.example.com", "project_id": 1234, "project_path": "platform/payments-api", "if_runner_id": 6, "enable_runner_id": 9}
