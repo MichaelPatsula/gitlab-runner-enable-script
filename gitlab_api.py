@@ -377,11 +377,11 @@ def iter_runner_projects(client: GitLabClient, runner_id: int, args: argparse.Na
     vlog(client.verbose, f"runner #{runner_id} is assigned to {len(candidates)} visible project(s)")
     if candidates and (args.group or args.membership or not args.include_archived):
         allowed: set[int] = set()
-        read = 0
+        listed = 0
         for project in client.list_projects(args.group, args.include_archived, args.membership):
-            read += 1
-            if read % DEFAULT_PER_PAGE == 0:
-                vlog(client.verbose, f"read {read:,} visible projects to match runner #{runner_id} filters")
+            listed += 1
+            if listed % DEFAULT_PER_PAGE == 0:
+                vlog(client.verbose, f"listed {listed} project(s) so far")
             if project.get("id") is not None:
                 allowed.add(int(project["id"]))
         candidates = {pid: project for pid, project in candidates.items() if pid in allowed}
@@ -445,6 +445,12 @@ def iter_projects_with_runner(
                 raise
             if exc.status == 403:
                 stats.inaccessible += 1
+                if stats.inaccessible == 1:
+                    print(
+                        "WARNING: this token cannot read runners for some projects (403), so results are partial. "
+                        "Use a Maintainer/Owner or admin token for a full scan.",
+                        file=sys.stderr,
+                    )
                 print(f"INACCESSIBLE {label}: {exc.message}", file=sys.stderr)
             else:
                 stats.failed += 1

@@ -481,6 +481,21 @@ class ScanAccessTests(unittest.TestCase):
         self.assertEqual(scan.failed, 0)
         self.assertIn("INACCESSIBLE a/one (id=1): Forbidden", stderr.getvalue())
 
+    def test_partial_warning_is_printed_once_for_many_forbidden_projects(self) -> None:
+        projects = [{"id": i, "path_with_namespace": f"a/p{i}"} for i in range(1, 4)]
+        client = ScriptedClient(
+            enabled={},
+            scan_errors={i: GitLabError(403, "Forbidden", f"/projects/{i}/runners") for i in range(1, 4)},
+        )
+        scan = RunnerScan()
+        stderr = StringIO()
+        with patch("sys.stderr", stderr):
+            list(iter_projects_with_runner(client, 6, projects, False, scan))
+        output = stderr.getvalue()
+        self.assertEqual(scan.inaccessible, 3)
+        self.assertEqual(output.count("WARNING: this token cannot read runners"), 1)
+        self.assertLess(output.index("WARNING"), output.index("INACCESSIBLE a/p1"))
+
 
 class RunnerProjectsClient:
     """Serves a runner's project list and the filtered project listing."""
@@ -522,19 +537,20 @@ class RunnerProjectsTests(unittest.TestCase):
         self.assertEqual(client.list_calls, [])
 
     def test_listing_progress_is_logged_every_100_projects_only_with_verbose(self) -> None:
-        listed = list(range(1, 251))
+        listed = list(range(1, 301))
         client = RunnerProjectsClient(self.RUNNER_PROJECTS, listed_ids=listed)
         with patch("sys.stderr", StringIO()) as quiet:
             list(iter_runner_projects(client, 6, self._args(["--membership"])))
-        self.assertNotIn("read ", quiet.getvalue())
+        self.assertNotIn("listed ", quiet.getvalue())
 
         client.verbose = True
         with patch("sys.stderr", StringIO()) as verbose:
             list(iter_runner_projects(client, 6, self._args(["--membership"])))
         output = verbose.getvalue()
-        self.assertIn("[verbose] read 100 visible projects to match runner #6 filters", output)
-        self.assertIn("[verbose] read 200 visible projects to match runner #6 filters", output)
-        self.assertNotIn("read 300", output)
+        self.assertIn("[verbose] listed 100 project(s) so far", output)
+        self.assertIn("[verbose] listed 200 project(s) so far", output)
+        self.assertIn("[verbose] listed 300 project(s) so far", output)
+        self.assertNotIn("listed 350", output)
 
     def test_client_requests_runner_projects_and_filters_by_type(self) -> None:
         client = StubClient(
