@@ -90,6 +90,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     print(path)
         except KeyboardInterrupt:
             exit_interrupted(_summary(stats))
+        except BaseException:
+            print(_summary(stats), file=sys.stderr)
+            raise
 
         print(_summary(stats), file=sys.stderr)
         return 1 if stats.failed else 0

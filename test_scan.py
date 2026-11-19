@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
 import urllib.error
 from io import BytesIO, StringIO
@@ -376,6 +379,49 @@ class InterruptTests(unittest.TestCase):
         self.assertIn("Scanned 1 projects; runner enabled on 1", stderr.getvalue())
         self.assertIn("Assigns already completed stay applied. Re-run to finish.", stderr.getvalue())
 
+    def test_list_runner_projects_fatal_error_still_prints_summary(self) -> None:
+        def projects():
+            yield {"id": 1, "path_with_namespace": "a/one"}
+            raise SystemExit(TOKEN_REJECTED)
+
+        client = MappingClient({1: {6}})
+        runner = {"id": 6, "description": "old", "runner_type": "project_type"}
+        stderr = StringIO()
+        with patch("list_runner_projects.client_from_args", return_value=client), patch(
+            "list_runner_projects.resolve_runner", return_value=runner
+        ), patch("list_runner_projects.iter_projects", return_value=projects()), patch(
+            "sys.stdout", StringIO()
+        ), patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                list_runner_projects.main(
+                    ["--gitlab-url", "https://gitlab.example.com", "--token", "t", "--runner", "6"]
+                )
+        self.assertEqual(caught.exception.code, TOKEN_REJECTED)
+        self.assertIn("Scanned 1 projects; runner enabled on 1", stderr.getvalue())
+
+    def test_enable_runner_fatal_error_still_prints_summary(self) -> None:
+        def projects():
+            yield {"id": 1, "path_with_namespace": "a/one"}
+            raise SystemExit(TOKEN_REJECTED)
+
+        client = MappingClient({1: {6}})
+        runners = {
+            "6": {"id": 6, "description": "old", "runner_type": "project_type"},
+            "9": {"id": 9, "description": "new", "runner_type": "project_type"},
+        }
+        stderr = StringIO()
+        with patch("enable_runner.client_from_args", return_value=client), patch(
+            "enable_runner.resolve_runner", side_effect=lambda _client, ident: runners[ident]
+        ), patch("enable_runner.iter_projects", return_value=projects()), patch(
+            "sys.stdout", StringIO()
+        ), patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                enable_runner.main(
+                    ["--gitlab-url", "https://gitlab.example.com", "--token", "t", "--if-runner", "6", "--enable-runner", "9"]
+                )
+        self.assertEqual(caught.exception.code, TOKEN_REJECTED)
+        self.assertIn("Scanned 1 projects; runner enabled on 1", stderr.getvalue())
+
 
 class ScriptedClient:
     """Per-project scripted results for project scans and assignments."""
@@ -491,6 +537,92 @@ class EnableAssignTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), TOKEN_REJECTED)
         self.assertEqual(client.scanned_ids, [1])
         self.assertEqual(client.assigned, [])
+
+
+class AuditLogTests(unittest.TestCase):
+    PROJECTS = [
+        {"id": 1, "path_with_namespace": "a/one"},
+        {"id": 2, "path_with_namespace": "a/two"},
+        {"id": 3, "path_with_namespace": "a/three"},
+        {"id": 4, "path_with_namespace": "a/four"},
+        {"id": 5, "path_with_namespace": "a/old", "archived": True},
+    ]
+    # 1 gets runner 9, 2 fails, 3 already has 9, 4 lacks runner 6, 5 is archived.
+    ENABLED = {1: {6}, 2: {6}, 3: {6, 9}, 4: {7}}
+
+    def _run(self, apply: bool, include_skips: bool = False) -> list[dict]:
+        client = ScriptedClient(
+            enabled=self.ENABLED,
+            assign_errors={2: GitLabError(500, "boom", "/projects/2/runners")},
+        )
+        out = StringIO()
+        audit = enable_runner.AuditLog(out, "https://gitlab.example.com", 6, 9, include_skips)
+        with patch("sys.stdout", StringIO()), patch("sys.stderr", StringIO()):
+            enable_runner.enable_on_projects(client, self.PROJECTS, 6, 9, apply, False, False, None, audit)
+        return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    @staticmethod
+    def _events(records: list[dict]) -> list[tuple]:
+        return [(r["event"], r["project_path"], r.get("reason")) for r in records]
+
+    def test_apply_records_assigned_and_failed_only(self) -> None:
+        records = self._run(apply=True)
+        self.assertEqual(
+            self._events(records),
+            [("assigned", "a/one", None), ("failed", "a/two", None)],
+        )
+        self.assertEqual(records[0]["project_id"], 1)
+        self.assertEqual(records[0]["if_runner_id"], 6)
+        self.assertEqual(records[0]["enable_runner_id"], 9)
+        self.assertEqual(records[0]["gitlab"], "https://gitlab.example.com")
+        self.assertIn("time", records[0])
+        self.assertEqual((records[1]["status"], records[1]["error"]), (500, "boom"))
+
+    def test_dry_run_records_planned(self) -> None:
+        records = self._run(apply=False)
+        self.assertEqual(
+            self._events(records),
+            [("planned", "a/one", None), ("planned", "a/two", None)],
+        )
+
+    def test_skips_are_recorded_only_when_requested(self) -> None:
+        records = self._run(apply=False, include_skips=True)
+        self.assertEqual(
+            self._events(records),
+            [
+                ("planned", "a/one", None),
+                ("planned", "a/two", None),
+                ("skipped", "a/four", "runner_not_enabled"),
+                ("skipped", "a/old", "archived"),
+            ],
+        )
+
+    def test_main_appends_to_audit_file(self) -> None:
+        runners = {
+            "6": {"id": 6, "description": "old", "runner_type": "project_type"},
+            "9": {"id": 9, "description": "new", "runner_type": "project_type"},
+        }
+        argv = ["--gitlab-url", "https://gitlab.example.com", "--token", "t", "--if-runner", "6", "--enable-runner", "9"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "audit.jsonl")
+            for apply in (False, True):
+                client = ScriptedClient(enabled={1: {6}})
+                with patch("enable_runner.client_from_args", return_value=client), patch(
+                    "enable_runner.resolve_runner", side_effect=lambda _client, ident: runners[ident]
+                ), patch("enable_runner.iter_projects", return_value=[{"id": 1, "path_with_namespace": "a/one"}]), patch(
+                    "sys.stdout", StringIO()
+                ), patch("sys.stderr", StringIO()):
+                    enable_runner.main(argv + ["--audit-log", path] + (["--apply"] if apply else []))
+            with open(path, encoding="utf-8") as handle:
+                events = [json.loads(line)["event"] for line in handle]
+        self.assertEqual(events, ["planned", "assigned"])
+
+    def test_audit_skips_requires_audit_log(self) -> None:
+        with patch("sys.stderr", StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as caught:
+                enable_runner.main(["--if-runner", "6", "--enable-runner", "9", "--audit-skips"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--audit-skips requires --audit-log", stderr.getvalue())
 
 
 class FakeResponse:

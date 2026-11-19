@@ -13,9 +13,13 @@ on the target project, or a custom role with admin_runners.
 from __future__ import annotations
 
 import argparse
+import io
+import json
+import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional
+from datetime import datetime, timezone
+from typing import Any, Iterable, Mapping, Optional, TextIO
 
 from gitlab_api import (
     GitLabClient,
@@ -44,6 +48,45 @@ class Stats:
     inaccessible: int = 0
 
 
+class AuditLog:
+    """Append-only JSONL record of planned, applied, and failed runner assignments.
+
+    Each line is flushed and fsynced as it is written, so a crash or Ctrl-C mid-run
+    leaves every earlier line intact.
+    """
+
+    def __init__(
+        self,
+        file: TextIO,
+        gitlab: str,
+        if_runner_id: int,
+        enable_runner_id: int,
+        include_skips: bool = False,
+    ) -> None:
+        self._file = file
+        self._base = {"gitlab": gitlab, "if_runner_id": if_runner_id, "enable_runner_id": enable_runner_id}
+        self.include_skips = include_skips
+
+    def record(self, event: str, project: Mapping[str, Any], **extra: Any) -> None:
+        entry = {
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "event": event,
+            **extra,
+            "gitlab": self._base["gitlab"],
+            "project_id": project.get("id"),
+            "project_path": project.get("path_with_namespace") or project.get("path"),
+            "if_runner_id": self._base["if_runner_id"],
+            "enable_runner_id": self._base["enable_runner_id"],
+        }
+        self._file.write(json.dumps(entry) + "\n")
+        self._file.flush()
+        try:
+            fd = self._file.fileno()
+        except (AttributeError, io.UnsupportedOperation):
+            return  # in-memory stream, nothing to sync
+        os.fsync(fd)
+
+
 def enable_on_projects(
     client: GitLabClient,
     projects: Iterable[Mapping[str, Any]],
@@ -53,10 +96,17 @@ def enable_on_projects(
     include_archived: bool,
     verbose: bool,
     stats: Optional[Stats] = None,
+    audit: Optional[AuditLog] = None,
 ) -> Stats:
     if stats is None:
         stats = Stats()
     scan = RunnerScan()
+    on_skip = None
+    if audit is not None and audit.include_skips:
+
+        def on_skip(project: Mapping[str, Any], reason: str) -> None:
+            audit.record("skipped", project, reason=reason)
+
     try:
         for project, enabled_ids in iter_projects_with_runner(
             client,
@@ -65,6 +115,7 @@ def enable_on_projects(
             include_archived,
             scan,
             verbose,
+            on_skip,
         ):
             label = project_label(project)
             if enable_runner_id in enabled_ids:
@@ -73,8 +124,10 @@ def enable_on_projects(
                 continue
             if not apply:
                 print(f"MATCH {label}: runner #{if_runner_id} is enabled; would enable runner #{enable_runner_id}")
+                if audit is not None:
+                    audit.record("planned", project)
                 continue
-            _assign(client, int(project["id"]), enable_runner_id, label, stats)
+            _assign(client, project, enable_runner_id, label, stats, audit)
     finally:
         stats.scanned = scan.scanned
         stats.matched = scan.enabled
@@ -84,9 +137,16 @@ def enable_on_projects(
     return stats
 
 
-def _assign(client: GitLabClient, project_id: int, enable_runner_id: int, label: str, stats: Stats) -> None:
+def _assign(
+    client: GitLabClient,
+    project: Mapping[str, Any],
+    enable_runner_id: int,
+    label: str,
+    stats: Stats,
+    audit: Optional[AuditLog] = None,
+) -> None:
     try:
-        client.assign_runner(project_id, enable_runner_id)
+        client.assign_runner(int(project["id"]), enable_runner_id)
     except GitLabError as exc:
         if exc.status == 401:
             raise
@@ -96,9 +156,13 @@ def _assign(client: GitLabClient, project_id: int, enable_runner_id: int, label:
             return
         stats.failed += 1
         print(f"FAIL {label}: {exc.message}", file=sys.stderr)
+        if audit is not None:
+            audit.record("failed", project, status=exc.status, error=exc.message)
         return
     stats.assigned += 1
     print(f"ASSIGN {label}: enabled runner #{enable_runner_id}")
+    if audit is not None:
+        audit.record("assigned", project)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,6 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
 
   # Limit the scan to a group, matching runners by description
   %(prog)s --group my-group/sub-group --if-runner old-runner --enable-runner new-runner --apply
+
+  # Keep a JSONL record of every assignment (append-only, safe to reuse across runs)
+  %(prog)s --if-runner 6 --enable-runner 9 --apply --audit-log runner-changes.jsonl
 """,
     )
     add_scan_arguments(parser)
@@ -134,6 +201,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="Enable that runner. Without this flag the script only reports matches.",
+    )
+    parser.add_argument(
+        "--audit-log",
+        metavar="PATH",
+        help=(
+            "Append one JSON line per planned (dry-run), assigned, or failed assignment to PATH. "
+            "The file is created if missing and never truncated."
+        ),
+    )
+    parser.add_argument(
+        "--audit-skips",
+        action="store_true",
+        help="Also record skipped projects (archived, or --if-runner not enabled) in --audit-log.",
     )
     parser.add_argument(
         "--verbose",
@@ -160,7 +240,10 @@ def _summary(stats: Stats) -> str:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.audit_skips and not args.audit_log:
+        parser.error("--audit-skips requires --audit-log")
     try:
         client = client_from_args(args)
         if_runner = resolve_runner(client, args.if_runner)
@@ -192,6 +275,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"If runner: {runner_label(if_runner)}")
         print(f"Enable runner: {runner_label(enable_runner)}")
 
+        audit_file: Optional[TextIO] = None
+        audit: Optional[AuditLog] = None
+        if args.audit_log:
+            try:
+                audit_file = open(args.audit_log, "a", encoding="utf-8")
+            except OSError as exc:
+                raise SystemExit(f"Cannot open audit log {args.audit_log}: {exc.strerror}")
+            audit = AuditLog(audit_file, client.base_url, if_runner_id, enable_runner_id, args.audit_skips)
+            print(f"Audit log: {args.audit_log}")
+
         stats = Stats()
         try:
             enable_on_projects(
@@ -203,6 +296,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.include_archived,
                 args.verbose,
                 stats,
+                audit,
             )
         except KeyboardInterrupt:
             extra = (
@@ -211,6 +305,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 else ""
             )
             exit_interrupted(_summary(stats), extra)
+        except BaseException:
+            print(_summary(stats), file=sys.stderr)
+            raise
+        finally:
+            if audit_file is not None:
+                audit_file.close()
 
         print(_summary(stats))
         if not args.apply and stats.matched > stats.already:

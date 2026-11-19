@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Iterator, Mapping, NoReturn, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, NoReturn, Optional
 
 
 DEFAULT_PER_PAGE = 100
@@ -364,8 +364,13 @@ def iter_projects_with_runner(
     include_archived: bool,
     stats: RunnerScan,
     verbose: bool = False,
+    on_skip: Optional[Callable[[Mapping[str, Any], str], None]] = None,
 ) -> Iterator[tuple[Mapping[str, Any], set[int]]]:
-    """Yield each project where runner_id is enabled, plus that project's runner ids."""
+    """Yield each project where runner_id is enabled, plus that project's runner ids.
+
+    on_skip(project, reason) is called for archived projects ("archived") and for
+    projects where runner_id is not enabled ("runner_not_enabled").
+    """
     pending = iter(projects)
     while True:
         try:
@@ -378,6 +383,8 @@ def iter_projects_with_runner(
             continue
         if not include_archived and project.get("archived") is True:
             print(f"SKIP {project_label(project)}: archived", file=sys.stderr)
+            if on_skip is not None and project.get("id") is not None:
+                on_skip(project, "archived")
             continue
         project_id = project.get("id")
         if project_id is None:
@@ -406,6 +413,8 @@ def iter_projects_with_runner(
             stats.skipped += 1
             if verbose:
                 print(f"SKIP {label}: runner #{runner_id} is not enabled")
+            if on_skip is not None:
+                on_skip(project, "runner_not_enabled")
         _progress(stats.scanned, stats.enabled)
 
 
