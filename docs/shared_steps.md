@@ -1,3 +1,13 @@
+  listed = 0
+        for project in client.list_projects(args.group, args.include_archived, args.membership):
+            listed += 1
+            if listed % DEFAULT_PER_PAGE == 0:
+                vlog(client.verbose, f"listed {listed} project(s) so far")
+
+
+
+
+
 # Shared steps (gitlab_api.py)
 
 Used by both `enable_runner.py` and `list_runner_projects.py`.
