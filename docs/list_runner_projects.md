@@ -3,18 +3,23 @@
 Lists every project where a given runner is enabled.
 
 ```text
-list_runner_projects.py --runner X [--group|--project|--membership] [--include-archived] [--verbose]
+list_runner_projects.py --runner X [--group|--project|--membership] [--include-archived] [--full-scan] [--verbose]
 
 main():
     args = parse_args()
     client = client_from_args(args)
     runner = resolve_runner(client, X)
-    print header to stderr: URL, runner
+    print header to stderr: URL, runner, scan source
 
-    for project in iter_projects(client, args):
+    if runner is a project runner and not --project and not --full-scan:
+        projects = iter_runner_projects(client, runner)   # runner's own projects, filtered
+    else:
+        projects = iter_projects(client, args)            # group/instance runners are inherited, so check all
+
+    for project in projects:
         if project failed to load: count FAIL, continue
         if archived and not --include-archived: print SKIP to stderr, continue (not counted; only reached with --project)
-        enabled = GET /projects/:id/runners (all pages)
+        enabled = GET /projects/:id/runners?type=<runner's type> (all pages)
             401 -> abort the run
             403 -> count INACCESSIBLE, print to stderr, continue
             other error -> count FAIL, print to stderr, continue

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Enable one GitLab runner on every project where another runner is already enabled.
 
-The scan of projects comes from gitlab_api.py. Both runners must be project runners.
+Candidate projects come from --if-runner's own project list, unless --project or
+--full-scan is given. Both runners must be project runners.
 A group or instance runner is inherited by many projects, so it cannot be used
 as --if-runner. Nothing is changed unless --apply is passed.
 
@@ -31,9 +32,11 @@ from gitlab_api import (
     exit_interrupted,
     iter_projects,
     iter_projects_with_runner,
+    iter_runner_projects,
     project_label,
     resolve_runner,
     runner_label,
+    uses_runner_projects,
 )
 
 
@@ -116,6 +119,7 @@ def enable_on_projects(
             scan,
             verbose,
             on_skip,
+            runner_type="project_type",
         ):
             label = project_label(project)
             if enable_runner_id in enabled_ids:
@@ -213,12 +217,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audit-skips",
         action="store_true",
-        help="Also record skipped projects (archived, or --if-runner not enabled) in --audit-log.",
+        help="Also record skipped projects (archived, or --if-runner not enabled) in --audit-log. "
+        "Projects without --if-runner are only visited with --full-scan or --project.",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print projects where --if-runner is not enabled, and log runner lookup steps to stderr.",
+        help="Print projects where --if-runner is not enabled (with --full-scan or --project), "
+        "and log runner lookup steps to stderr.",
     )
     return parser
 
@@ -274,6 +280,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Mode: {'apply' if args.apply else 'dry-run'}")
         print(f"If runner: {runner_label(if_runner)}")
         print(f"Enable runner: {runner_label(enable_runner)}")
+        from_runner = uses_runner_projects(args, if_runner)
+        if from_runner:
+            print(f"Scan: projects assigned to runner #{if_runner_id} (pass --full-scan to check every project)")
+        else:
+            print("Scan: named projects" if args.project else "Scan: every project")
 
         audit_file: Optional[TextIO] = None
         audit: Optional[AuditLog] = None
@@ -286,10 +297,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"Audit log: {args.audit_log}")
 
         stats = Stats()
+        projects = iter_runner_projects(client, if_runner_id, args) if from_runner else iter_projects(client, args)
         try:
             enable_on_projects(
                 client,
-                iter_projects(client, args),
+                projects,
                 if_runner_id,
                 enable_runner_id,
                 args.apply,

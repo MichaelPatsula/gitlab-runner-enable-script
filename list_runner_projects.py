@@ -4,8 +4,12 @@
 A runner is enabled on a project when it appears in that project's runner list:
 an assigned project runner, an allowed group runner, or an allowed instance
 runner. Matching project paths are printed one per line. Progress and errors
-go to stderr. Pass --verbose to also print projects where the runner
-is not enabled.
+go to stderr.
+
+For a project runner, candidates come from the runner's own project list unless
+--project or --full-scan is given. Group and instance runners are inherited, so
+every project is checked. Pass --verbose to also print checked projects where
+the runner is not enabled.
 
 Requires Python 3.9+ and a GitLab token with the api scope.
 """
@@ -25,9 +29,11 @@ from gitlab_api import (
     exit_interrupted,
     iter_projects,
     iter_projects_with_runner,
+    iter_runner_projects,
     project_label,
     resolve_runner,
     runner_label,
+    uses_runner_projects,
 )
 
 
@@ -53,7 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Also print projects where the runner is not enabled, and log runner lookup steps to stderr.",
+        help="Also print checked projects where the runner is not enabled (every project only with "
+        "--full-scan or a group/instance runner), and log runner lookup steps to stderr.",
     )
     return parser
 
@@ -72,16 +79,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         runner = resolve_runner(client, args.runner)
         print(f"GitLab: {client.base_url}", file=sys.stderr)
         print(f"Runner: {runner_label(runner)}", file=sys.stderr)
+        runner_id = int(runner["id"])
+        if uses_runner_projects(args, runner):
+            print(f"Scan: projects assigned to runner #{runner_id} (pass --full-scan to check every project)", file=sys.stderr)
+            projects = iter_runner_projects(client, runner_id, args)
+        else:
+            print("Scan: named projects" if args.project else "Scan: every project", file=sys.stderr)
+            projects = iter_projects(client, args)
 
         stats = RunnerScan()
         try:
             for project, _enabled_ids in iter_projects_with_runner(
                 client,
-                int(runner["id"]),
-                iter_projects(client, args),
+                runner_id,
+                projects,
                 args.include_archived,
                 stats,
                 args.verbose,
+                runner_type=runner.get("runner_type"),
             ):
                 if args.verbose:
                     print(f"ENABLED {project_label(project)}")

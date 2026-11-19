@@ -109,7 +109,8 @@ class GitLabClient:
             next_url = None
 
     def get_runner(self, runner_id: int) -> dict[str, Any]:
-        payload = self.get_json(f"/runners/{runner_id}")
+        # The embedded project list is unpaginated; runner_projects() pages it instead.
+        payload = self.get_json(f"/runners/{runner_id}", {"include_projects": "false"})
         if not isinstance(payload, dict) or "id" not in payload:
             raise GitLabError(200, "runner response was missing an id", f"/runners/{runner_id}")
         return payload
@@ -149,10 +150,15 @@ class GitLabClient:
             raise GitLabError(200, "project response was missing an id", f"/projects/{encoded}")
         return payload
 
-    def project_runner_ids(self, project_id: int) -> set[int]:
+    def runner_projects(self, runner_id: int) -> Iterator[dict[str, Any]]:
+        """Projects a project runner is assigned to, limited to those the token can see."""
+        yield from self.paginate(f"/runners/{runner_id}/projects")
+
+    def project_runner_ids(self, project_id: int, runner_type: Optional[str] = None) -> set[int]:
         ids: set[int] = set()
         runner_path = f"/projects/{project_id}/runners"
-        for runner in self.paginate(runner_path):
+        params = {"type": runner_type} if runner_type else None
+        for runner in self.paginate(runner_path, params):
             runner_id = runner.get("id")
             if runner_id is None:
                 raise GitLabError(200, "runner response was missing an id", runner_path)
@@ -348,6 +354,39 @@ def iter_projects(client: GitLabClient, args: argparse.Namespace) -> Iterable[An
     yield from client.list_projects(args.group, args.include_archived, args.membership)
 
 
+def uses_runner_projects(args: argparse.Namespace, runner: Mapping[str, Any]) -> bool:
+    """True when candidates can come from the runner's own project list instead of every project."""
+    return not args.project and not args.full_scan and runner.get("runner_type") == "project_type"
+
+
+def iter_runner_projects(client: GitLabClient, runner_id: int, args: argparse.Namespace) -> Iterator[dict[str, Any]]:
+    """Yield the projects a project runner is assigned to, in id order.
+
+    The runner's project list has no archived flag and ignores --group and
+    --membership, so those filters are applied by intersecting with the same
+    project listing a full scan would use. That listing is skipped when no
+    filter is active.
+    """
+    path = f"/runners/{runner_id}/projects"
+    candidates: dict[int, dict[str, Any]] = {}
+    for project in client.runner_projects(runner_id):
+        project_id = project.get("id")
+        if project_id is None:
+            raise GitLabError(200, "project response was missing an id", path)
+        candidates[int(project_id)] = project
+    vlog(client.verbose, f"runner #{runner_id} is assigned to {len(candidates)} visible project(s)")
+    if candidates and (args.group or args.membership or not args.include_archived):
+        allowed = {
+            int(project["id"])
+            for project in client.list_projects(args.group, args.include_archived, args.membership)
+            if project.get("id") is not None
+        }
+        candidates = {pid: project for pid, project in candidates.items() if pid in allowed}
+        vlog(client.verbose, f"{len(candidates)} project(s) left after --group/--membership/archived filters")
+    for project_id in sorted(candidates):
+        yield candidates[project_id]
+
+
 @dataclass
 class RunnerScan:
     scanned: int = 0
@@ -365,11 +404,14 @@ def iter_projects_with_runner(
     stats: RunnerScan,
     verbose: bool = False,
     on_skip: Optional[Callable[[Mapping[str, Any], str], None]] = None,
+    runner_type: Optional[str] = None,
 ) -> Iterator[tuple[Mapping[str, Any], set[int]]]:
     """Yield each project where runner_id is enabled, plus that project's runner ids.
 
     on_skip(project, reason) is called for archived projects ("archived") and for
-    projects where runner_id is not enabled ("runner_not_enabled").
+    projects where runner_id is not enabled ("runner_not_enabled"). runner_type
+    limits each project's runner list to that type, so the yielded ids only
+    include runners of that type.
     """
     pending = iter(projects)
     while True:
@@ -394,7 +436,7 @@ def iter_projects_with_runner(
         stats.scanned += 1
         label = project_label(project)
         try:
-            enabled_ids = client.project_runner_ids(int(project_id))
+            enabled_ids = client.project_runner_ids(int(project_id), runner_type=runner_type)
         except GitLabError as exc:
             if exc.status == 401:
                 raise
@@ -448,6 +490,14 @@ def add_scan_arguments(parser: argparse.ArgumentParser) -> None:
         "--include-archived",
         action="store_true",
         help="Include archived projects.",
+    )
+    parser.add_argument(
+        "--full-scan",
+        action="store_true",
+        help=(
+            "Check every project's runner list instead of starting from the project runner's own "
+            "project list. Slower; use it to list every project without the runner."
+        ),
     )
 
 

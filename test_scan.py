@@ -26,13 +26,14 @@ from gitlab_api import (
     exit_gitlab_error,
     exit_interrupted,
     iter_projects_with_runner,
+    iter_runner_projects,
     raise_api_status,
     resolve_runner,
 )
 
 
 class FakeClient:
-    def project_runner_ids(self, project_id: int) -> set[int]:
+    def project_runner_ids(self, project_id: int, runner_type=None) -> set[int]:
         return {6}
 
 
@@ -41,7 +42,7 @@ class MappingClient:
         self.base_url = "https://gitlab.example.com"
         self.runners_by_project = runners_by_project
 
-    def project_runner_ids(self, project_id: int) -> set[int]:
+    def project_runner_ids(self, project_id: int, runner_type=None) -> set[int]:
         return self.runners_by_project[project_id]
 
     def assign_runner(self, project_id: int, runner_id: int) -> None:
@@ -128,7 +129,7 @@ class ListRunnerProjectsTests(unittest.TestCase):
         extra = ["--verbose"] if verbose else []
         with patch("list_runner_projects.client_from_args", return_value=client), patch(
             "list_runner_projects.resolve_runner", return_value=runner
-        ), patch("list_runner_projects.iter_projects", return_value=projects), patch(
+        ), patch("list_runner_projects.iter_runner_projects", return_value=projects), patch(
             "sys.stdout", stdout
         ), patch("sys.stderr", stderr):
             status = list_runner_projects.main(argv + extra)
@@ -164,7 +165,7 @@ class ListRunnerProjectsTests(unittest.TestCase):
         stderr = StringIO()
         with patch("list_runner_projects.client_from_args", return_value=client), patch(
             "list_runner_projects.resolve_runner", return_value=runner
-        ), patch("list_runner_projects.iter_projects", return_value=projects()), patch(
+        ), patch("list_runner_projects.iter_runner_projects", return_value=projects()), patch(
             "sys.stdout", stdout
         ), patch("sys.stderr", stderr):
             with self.assertRaises(SystemExit) as caught:
@@ -357,7 +358,7 @@ class InterruptTests(unittest.TestCase):
         stderr = StringIO()
         with patch("enable_runner.client_from_args", return_value=client), patch(
             "enable_runner.resolve_runner", side_effect=lambda _client, ident: runners[ident]
-        ), patch("enable_runner.iter_projects", return_value=projects()), patch(
+        ), patch("enable_runner.iter_runner_projects", return_value=projects()), patch(
             "sys.stdout", stdout
         ), patch("sys.stderr", stderr):
             with self.assertRaises(SystemExit) as caught:
@@ -389,7 +390,7 @@ class InterruptTests(unittest.TestCase):
         stderr = StringIO()
         with patch("list_runner_projects.client_from_args", return_value=client), patch(
             "list_runner_projects.resolve_runner", return_value=runner
-        ), patch("list_runner_projects.iter_projects", return_value=projects()), patch(
+        ), patch("list_runner_projects.iter_runner_projects", return_value=projects()), patch(
             "sys.stdout", StringIO()
         ), patch("sys.stderr", stderr):
             with self.assertRaises(SystemExit) as caught:
@@ -412,7 +413,7 @@ class InterruptTests(unittest.TestCase):
         stderr = StringIO()
         with patch("enable_runner.client_from_args", return_value=client), patch(
             "enable_runner.resolve_runner", side_effect=lambda _client, ident: runners[ident]
-        ), patch("enable_runner.iter_projects", return_value=projects()), patch(
+        ), patch("enable_runner.iter_runner_projects", return_value=projects()), patch(
             "sys.stdout", StringIO()
         ), patch("sys.stderr", stderr):
             with self.assertRaises(SystemExit) as caught:
@@ -434,7 +435,7 @@ class ScriptedClient:
         self.scanned_ids: list[int] = []
         self.assigned: list[tuple[int, int]] = []
 
-    def project_runner_ids(self, project_id: int) -> set[int]:
+    def project_runner_ids(self, project_id: int, runner_type=None) -> set[int]:
         self.scanned_ids.append(project_id)
         if project_id in self.scan_errors:
             raise self.scan_errors[project_id]
@@ -475,6 +476,91 @@ class ScanAccessTests(unittest.TestCase):
         self.assertEqual(scan.inaccessible, 1)
         self.assertEqual(scan.failed, 0)
         self.assertIn("INACCESSIBLE a/one (id=1): Forbidden", stderr.getvalue())
+
+
+class RunnerProjectsClient:
+    """Serves a runner's project list and the filtered project listing."""
+
+    def __init__(self, runner_projects, listed_ids) -> None:
+        self.verbose = False
+        self._runner_projects = runner_projects
+        self._listed_ids = listed_ids
+        self.list_calls: list[tuple] = []
+
+    def runner_projects(self, runner_id: int):
+        return iter(self._runner_projects)
+
+    def list_projects(self, group, include_archived, membership):
+        self.list_calls.append((group, include_archived, membership))
+        return iter({"id": pid} for pid in self._listed_ids)
+
+
+class RunnerProjectsTests(unittest.TestCase):
+    RUNNER_PROJECTS = [
+        {"id": 3, "path_with_namespace": "g/three"},
+        {"id": 1, "path_with_namespace": "g/one"},
+        {"id": 2, "path_with_namespace": "other/two"},
+    ]
+
+    def _args(self, argv: list[str]):
+        return enable_runner.build_parser().parse_args(["--if-runner", "6", "--enable-runner", "9"] + argv)
+
+    def test_filters_are_applied_by_intersecting_with_the_project_listing(self) -> None:
+        client = RunnerProjectsClient(self.RUNNER_PROJECTS, listed_ids=[1, 3, 99])
+        found = [p["id"] for p in iter_runner_projects(client, 6, self._args(["--group", "g", "--membership"]))]
+        self.assertEqual(found, [1, 3])
+        self.assertEqual(client.list_calls, [("g", False, True)])
+
+    def test_listing_is_skipped_without_filters(self) -> None:
+        client = RunnerProjectsClient(self.RUNNER_PROJECTS, listed_ids=[])
+        found = [p["id"] for p in iter_runner_projects(client, 6, self._args(["--include-archived"]))]
+        self.assertEqual(found, [1, 2, 3])
+        self.assertEqual(client.list_calls, [])
+
+    def test_client_requests_runner_projects_and_filters_by_type(self) -> None:
+        client = StubClient(
+            [
+                ({"id": 6}, Header({})),
+                ([{"id": 1}], Header({})),
+                ([{"id": 6}], Header({})),
+            ]
+        )
+        client.get_runner(6)
+        list(client.runner_projects(6))
+        self.assertEqual(client.project_runner_ids(1, runner_type="project_type"), {6})
+        self.assertEqual(client.calls[0], {"include_projects": "false"})
+        self.assertEqual(client.calls[2]["type"], "project_type")
+
+    def _main(self, module, argv, runner_type: str):
+        runners = {
+            "6": {"id": 6, "description": "old", "runner_type": runner_type},
+            "9": {"id": 9, "description": "new", "runner_type": "project_type"},
+        }
+        client = ScriptedClient(enabled={1: {6}})
+        projects = [{"id": 1, "path_with_namespace": "a/one"}]
+        with patch(f"{module.__name__}.client_from_args", return_value=client), patch(
+            f"{module.__name__}.resolve_runner", side_effect=lambda _client, ident: runners[ident]
+        ), patch(f"{module.__name__}.iter_projects", return_value=projects) as full, patch(
+            f"{module.__name__}.iter_runner_projects", return_value=projects
+        ) as from_runner, patch("sys.stdout", StringIO()), patch("sys.stderr", StringIO()), patch.object(
+            client, "project_runner_ids", wraps=client.project_runner_ids
+        ) as check:
+            module.main(["--gitlab-url", "https://gitlab.example.com", "--token", "t"] + argv)
+        return full, from_runner, check
+
+    def test_enable_runner_full_scan_checks_every_project(self) -> None:
+        full, from_runner, check = self._main(
+            enable_runner, ["--if-runner", "6", "--enable-runner", "9", "--full-scan"], "project_type"
+        )
+        full.assert_called_once()
+        from_runner.assert_not_called()
+        check.assert_called_once_with(1, runner_type="project_type")
+
+    def test_list_runner_projects_scans_every_project_for_a_group_runner(self) -> None:
+        full, from_runner, check = self._main(list_runner_projects, ["--runner", "6"], "group_type")
+        full.assert_called_once()
+        from_runner.assert_not_called()
+        check.assert_called_once_with(1, runner_type="group_type")
 
 
 class EnableAssignTests(unittest.TestCase):
@@ -609,7 +695,7 @@ class AuditLogTests(unittest.TestCase):
                 client = ScriptedClient(enabled={1: {6}})
                 with patch("enable_runner.client_from_args", return_value=client), patch(
                     "enable_runner.resolve_runner", side_effect=lambda _client, ident: runners[ident]
-                ), patch("enable_runner.iter_projects", return_value=[{"id": 1, "path_with_namespace": "a/one"}]), patch(
+                ), patch("enable_runner.iter_runner_projects", return_value=[{"id": 1, "path_with_namespace": "a/one"}]), patch(
                     "sys.stdout", StringIO()
                 ), patch("sys.stderr", StringIO()):
                     enable_runner.main(argv + ["--audit-log", path] + (["--apply"] if apply else []))

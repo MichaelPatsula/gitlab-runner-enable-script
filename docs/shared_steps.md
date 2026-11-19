@@ -10,12 +10,12 @@ client_from_args(args):
 
 resolve_runner(client, ident):
     if ident is numeric:
-        GET /runners/:id; return if found
+        GET /runners/:id?include_projects=false; return if found
         on 404, fall through to description search
     list all runners (GET /runners/all, falls back to /runners on 403)
     match by exact description or name; then case-insensitive
     error if no match or more than one match
-    return GET /runners/:id
+    return GET /runners/:id?include_projects=false
     verbose: log each step and match counts to stderr
 
 iter_projects(client, args):
@@ -27,8 +27,15 @@ iter_projects(client, args):
         archived=false unless --include-archived
         membership=true with --membership
 
-project_runner_ids(client, project_id):
-    GET /projects/:id/runners, following next links until no pages remain
+iter_runner_projects(client, runner_id, args):     # project runners, without --project/--full-scan
+    candidates = GET /runners/:id/projects (all pages; only projects the token can see)
+    if --group, --membership, or archived filtering applies:
+        allowed = ids from the same listing iter_projects would use
+        candidates = candidates whose id is in allowed
+    yield candidates in id order
+
+project_runner_ids(client, project_id, runner_type):
+    GET /projects/:id/runners?type=runner_type, following next links until no pages remain
 
 request retry:
     up to 6 attempts

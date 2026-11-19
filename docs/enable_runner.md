@@ -3,7 +3,7 @@
 Enables one project runner on every project where another project runner is already enabled.
 
 ```text
-enable_runner.py --if-runner X --enable-runner Y [--apply] [--audit-log PATH [--audit-skips]] [--group|--project|--membership] [--include-archived] [--verbose]
+enable_runner.py --if-runner X --enable-runner Y [--apply] [--audit-log PATH [--audit-skips]] [--group|--project|--membership] [--include-archived] [--full-scan] [--verbose]
 
 main():
     args = parse_args()                        # --audit-skips without --audit-log -> usage error
@@ -14,17 +14,23 @@ main():
         ids must differ
         both runners must be project runners
         warn if enable_runner is locked
-    print header: URL, mode, both runners
+    print header: URL, mode, both runners, scan source
     if --audit-log: open PATH for append (exit if it cannot be opened)
 
-    for project in iter_projects(client, args):      # --project list, --group, or all
+    if --project or --full-scan:
+        projects = iter_projects(client, args)              # --project list, --group, or all
+    else:
+        projects = iter_runner_projects(client, if_runner)  # runner's own projects, filtered
+
+    for project in projects:
         if project failed to load: count FAIL, continue
         if archived and not --include-archived: print SKIP to stderr, audit "skipped" (with --audit-skips), continue (not counted; only reached with --project)
-        enabled = GET /projects/:id/runners (all pages)
+        enabled = GET /projects/:id/runners?type=project_type (all pages)
             401 -> abort the run
             403 -> count INACCESSIBLE, print to stderr, continue
             other error -> count FAIL, print to stderr, continue
-        if if_runner not in enabled:
+        if if_runner not in enabled:                 # reached only with --project or --full-scan, or if the
+                                                     # runner was unassigned during the run
             count SKIP; print only with --verbose; audit "skipped" (with --audit-skips)
             continue
         if enable_runner in enabled:
