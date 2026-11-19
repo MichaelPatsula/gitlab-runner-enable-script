@@ -521,6 +521,21 @@ class RunnerProjectsTests(unittest.TestCase):
         self.assertEqual(found, [1, 2, 3])
         self.assertEqual(client.list_calls, [])
 
+    def test_listing_progress_is_logged_every_100_projects_only_with_verbose(self) -> None:
+        listed = list(range(1, 251))
+        client = RunnerProjectsClient(self.RUNNER_PROJECTS, listed_ids=listed)
+        with patch("sys.stderr", StringIO()) as quiet:
+            list(iter_runner_projects(client, 6, self._args(["--membership"])))
+        self.assertNotIn("read ", quiet.getvalue())
+
+        client.verbose = True
+        with patch("sys.stderr", StringIO()) as verbose:
+            list(iter_runner_projects(client, 6, self._args(["--membership"])))
+        output = verbose.getvalue()
+        self.assertIn("[verbose] read 100 visible projects to match runner #6 filters", output)
+        self.assertIn("[verbose] read 200 visible projects to match runner #6 filters", output)
+        self.assertNotIn("read 300", output)
+
     def test_client_requests_runner_projects_and_filters_by_type(self) -> None:
         client = StubClient(
             [

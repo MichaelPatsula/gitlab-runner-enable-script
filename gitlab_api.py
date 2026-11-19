@@ -376,11 +376,14 @@ def iter_runner_projects(client: GitLabClient, runner_id: int, args: argparse.Na
         candidates[int(project_id)] = project
     vlog(client.verbose, f"runner #{runner_id} is assigned to {len(candidates)} visible project(s)")
     if candidates and (args.group or args.membership or not args.include_archived):
-        allowed = {
-            int(project["id"])
-            for project in client.list_projects(args.group, args.include_archived, args.membership)
-            if project.get("id") is not None
-        }
+        allowed: set[int] = set()
+        read = 0
+        for project in client.list_projects(args.group, args.include_archived, args.membership):
+            read += 1
+            if read % DEFAULT_PER_PAGE == 0:
+                vlog(client.verbose, f"read {read:,} visible projects to match runner #{runner_id} filters")
+            if project.get("id") is not None:
+                allowed.add(int(project["id"]))
         candidates = {pid: project for pid, project in candidates.items() if pid in allowed}
         vlog(client.verbose, f"{len(candidates)} project(s) left after --group/--membership/archived filters")
     for project_id in sorted(candidates):

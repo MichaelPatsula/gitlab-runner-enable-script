@@ -106,6 +106,6 @@ The runner's project list (`GET /runners/:id/projects`) requires GitLab 18.6 or 
 | `--membership` | Scan only projects the token's user belongs to. |
 | `--include-archived` | Include archived projects. |
 | `--full-scan` | Check every project's runner list instead of starting from the project runner's own project list. Slower. |
-| `--verbose` | Print checked projects where the runner is not enabled. On `list_runner_projects.py` that is `--runner`; on `enable_runner.py` it is `--if-runner`. |
+| `--verbose` | Print checked projects where the runner is not enabled, and log progress while the project listing is read (every 100 projects). On `list_runner_projects.py` that is `--runner`; on `enable_runner.py` it is `--if-runner`. |
 
 Both scripts exit with status 1 when a project could not be loaded or updated. A 403 while reading a project's runners is reported as inaccessible and does not fail the command. Ctrl+C prints `Interrupted` and the stats collected so far, then exits 130. Assigns that already succeeded stay applied; re-run with `--apply` to finish.
